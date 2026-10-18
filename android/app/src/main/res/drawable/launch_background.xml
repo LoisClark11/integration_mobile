@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The frame Flutter paints over before its first frame: the same
+     blush diagonal as the in-app header, so there is no white flash
+     between the launcher and the splash screen. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="315"
+                android:startColor="#C25E7A"
+                android:endColor="#F0A6B8" />
+        </shape>
+    </item>
+</layer-list>
