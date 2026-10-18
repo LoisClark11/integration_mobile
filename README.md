@@ -16,4 +16,4 @@ Skincare e-commerce app for browsing and ordering products.
 
 ## Download
 
-Grab the latest Android APK from the [releases page](../../releases/latest) and install it on your device.
+Grab the latest Android APK from the [releases page](https://github.com/LoisClark11/integration_mobile/releases/latest) and install it on your device.
