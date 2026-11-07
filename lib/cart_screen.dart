@@ -2,15 +2,13 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'checkout_screen.dart';
-import 'package:intl/intl.dart';
+import 'currency_format.dart';
 import 'session.dart';
 import 'app_repository.dart';
 import 'login_screen.dart';
 import 'gradient_header.dart';
 import 'product_image.dart';
 import 'stock_label.dart';
-
-final currencyFormatter = NumberFormat('#,##0.00');
 
 class CartScreen extends StatefulWidget {
   const CartScreen({super.key});
@@ -295,7 +293,7 @@ class _CartScreenState extends State<CartScreen> {
                       ),
                       const SizedBox(height: 5),
                       Text(
-                        "PHP ${currencyFormatter.format(price)} each",
+                        "${CurrencyFormat.php(price)} each",
                         style: const TextStyle(
                           color: Color(0xFFC25E7A),
                           fontWeight: FontWeight.w600,
@@ -303,7 +301,7 @@ class _CartScreenState extends State<CartScreen> {
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        "Subtotal: PHP ${currencyFormatter.format(price * quantity)}",
+                        "Subtotal: ${CurrencyFormat.php(price * quantity)}",
                         style: const TextStyle(
                           color: Colors.grey,
                           fontSize: 12,
@@ -436,7 +434,7 @@ class _CartScreenState extends State<CartScreen> {
                 ),
               ),
               Text(
-                "PHP ${currencyFormatter.format(total)}",
+                CurrencyFormat.php(total),
                 style: const TextStyle(
                   color: Color(0xFFC25E7A),
                   fontSize: 21,

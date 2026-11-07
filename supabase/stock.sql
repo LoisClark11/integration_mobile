@@ -178,7 +178,7 @@ begin
     p_item_count,
     p_items,
     p_purchase_type,
-    'Completed'
+    'Pending'
   )
   returning id into v_order_id;
 

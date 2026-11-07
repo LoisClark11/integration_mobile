@@ -67,7 +67,8 @@ Do not add new `.from('…')` calls in screens. Route data through `AppRepositor
 | `lib/product_detail_screen.dart` | Product page + “Other Products” + Add to cart / Buy now |
 | `lib/cart_screen.dart` | Cart lines; quantity capped at live stock |
 | `lib/checkout_screen.dart` | Checkout; delivery fee **50**; calls `AppRepository.createOrder` |
-| `lib/order_detail_screen.dart` | One order; cancel / delete |
+| `lib/order_status.dart` | `readOrderStatus` + labels/colors/icons for the four statuses |
+| `lib/order_detail_screen.dart` | One order; status banner, cancel / delete |
 | `lib/user_profile_screen.dart` | Profile, avatar upload (`avatars` bucket), My Orders, sign out |
 | `lib/login_screen.dart` | Sign in |
 | `lib/create_account_screen.dart` | Sign up |
@@ -91,6 +92,7 @@ Do not add new `.from('…')` calls in screens. Route data through `AppRepositor
 |---|---|
 | `supabase/schema.sql` | Tables, replica identity, RLS, `is_admin()`, `place_order()`, profile trigger, realtime publication |
 | `supabase/stock.sql` | Stock column + `place_order` only (use if you do not want a full schema re-run) |
+| `supabase/users.sql` | Admin users-list RPC (`admin_list_users()`), idempotent upgrade |
 | `../touchskin-admin/index.html` | Admin UI shell |
 | `../touchskin-admin/app.js` | Admin flows (upload, save, slides, orders, XSS-safe order cells) |
 | `../touchskin-admin/supabase-config.js` | Admin URL + anon/publishable key |
@@ -135,9 +137,9 @@ An AI changing this repo should treat these as hard constraints.
 10. **`item_name` / `item_price` are legacy overrides.** Admin no longer writes them. App still honours them if present, else uses the linked product.
 11. **Cart lines snapshot `name`, `price`, `image_url`.** Unique `(user_id, product_id)`. Quantity `+` is capped at live `products.stock`.
 12. **Delivery fee is 50** (`CheckoutScreen._deliveryFee` and `orders.delivery_fee` default).
-13. **Order `status` is `'Completed' | 'Cancelled'`.** Customers can cancel/delete **their own** orders. Admins have **SELECT all orders**, no UPDATE.
+13. **Order `status` is `'Pending' | 'Processing' | 'Delivered' | 'Cancelled'`.** New orders start `Pending`. Admins may set any of the four; customers may only cancel their own while it is `Pending` or `Processing`. `Delivered` and `Cancelled` are final. Cancelling a Pending/Processing order restocks once; cancelling a Delivered order does not. Admins have **SELECT all orders** and **UPDATE status only** — `guard_order_update()` freezes every other column.
 14. **`customer_email` is filled inside `place_order` from `auth.users`**, not from the app. Do not add it as an RPC argument.
-15. **`profiles` RLS is own-row only.** Admins cannot join orders → profiles. That is why email is snapshotted on the order.
+15. **`profiles` RLS is own-row only.** Admins cannot browse other profile rows directly. The admin Users tab reads the `admin_list_users()` RPC instead (SECURITY DEFINER, admin-gated); that is also why email is snapshotted on the order.
 16. **Replica identity FULL** on `cart_items`, `orders`, `featured_slides`. Without it, filtered DELETE events never reach the device (row stays on screen).
 17. **Storage `bucket_id` is text** (the bucket id string) on current projects. `bucket_id = 'avatars'` works directly; the storage policies are installed by schema section 2d with owner checks.
 18. **Session is in-memory.** `persistSession: false` and `autoRefreshToken: false`. Cold start is signed out. Password reset still works via deep link + in-memory session for that process.
@@ -158,7 +160,11 @@ An AI changing this repo should treat these as hard constraints.
 | `featured_slides` | read + realtime, `is_active = true` | `id`, `product_id`, `title`, `subtitle`, `banner_url`, `item_name`, `item_price`, `button_label`, `display_order`, `is_active` |
 | `cart_items` | CRUD own rows | `id`, `user_id`, `product_id`, `quantity`, `name`, `price`, `image_url` |
 | `orders` | create via RPC; read/cancel/delete own | `id`, `customer_name`, `customer_email`, `address`, `payment_method`, `subtotal_amount`, `delivery_fee`, `total_amount`, `item_count`, `items`, `status`, `created_at`, `purchase_type`, `cancelled_at` |
-| `profiles` | read/update own | `id`, `username`, `profile_image`, `role` (admin app only) |
+
+`orders.status` is one of `Pending`, `Processing`, `Delivered`, `Cancelled`.
+`place_order()` writes `Pending`; the dashboard moves it forward. The app
+shows all four and may only cancel while `Pending`/`Processing`.
+| `profiles` | read/update own; admins read all via `admin_list_users()` RPC | `id`, `username`, `profile_image`, `role` (admin app only) |
 
 Fallbacks: blank `description` → `"No description available"`. Missing/failed `image_url` → bundled placeholder. Missing `stock` column → hide badge (`readStock` returns null), do not show “Out of stock”.
 
@@ -205,7 +211,7 @@ That string is stored in `image_url` / `banner_url` / `profile_image`. The store
 |---|---|---|---|
 | Signed out | SELECT | none | none |
 | Customer | SELECT | own rows | no |
-| Admin (`profiles.role = 'admin'`) | SELECT + INSERT/UPDATE/DELETE | own rows | SELECT only |
+| Admin (`profiles.role = 'admin'`) | SELECT + INSERT/UPDATE/DELETE | own rows | SELECT + UPDATE status |
 
 `role` defaults to `'customer'`. Until at least one profile is promoted, every admin save fails with `new row violates row-level security policy`. Re-running the schema does **not** promote anyone.
 
@@ -240,6 +246,16 @@ Project Settings → API:
 SQL Editor → paste all of `supabase/schema.sql` → Run.
 
 Stock-only follow-up: `supabase/stock.sql` (column, function, grants, verification **before** any backfill).
+
+Order-status upgrade for an existing database: `supabase/order_status.sql`
+(idempotent; converts legacy `Completed` rows to `Delivered`, installs the
+four-value CHECK, the admin UPDATE policy, `guard_order_update()` and the
+restock rule). Fresh installs get the same rules from `supabase/schema.sql`.
+
+Admin users list for an existing database: `supabase/users.sql` (idempotent;
+installs the admin-gated `admin_list_users()` RPC that joins `auth.users`,
+`profiles` and `orders`). Fresh installs get the same function from
+`supabase/schema.sql`.
 
 ### 6c. Buckets
 
@@ -395,9 +411,38 @@ create policy "admins can read all orders"
   on public.orders for select
   to authenticated
   using (public.is_admin());
+
+create policy "admins can update all orders"
+  on public.orders for update
+  to authenticated
+  using (public.is_admin())
+  with check (public.is_admin());
 ```
 
 Permissive policies **OR**. Customers still only match `auth.uid() = user_id`. After adding admin-read, **verify a customer still sees only their own orders**.
+
+The UPDATE policy only decides *who* may touch a row. `guard_order_update()`
+decides *what* may change:
+
+- an admin may move a Pending/Processing order to any of `Pending`,
+  `Processing`, `Delivered` or `Cancelled`;
+- a Delivered order may only be cancelled, not reopened to Pending/Processing;
+- a customer may only set `Cancelled`, and only while the stored status is
+  `Pending` or `Processing`;
+- `Cancelled` is final, so an admin cannot reopen it (this also keeps the
+  restock trigger from putting the same units back twice);
+- every other column is immutable, so the dashboard cannot rewrite a
+  customer's history.
+
+`restock_on_cancel()` puts stock back only on a `Pending`/`Processing` →
+`Cancelled` transition. Cancelling a `Delivered` order deliberately does not
+restock.
+
+The dashboard writes status with:
+
+```js
+supabase.from("orders").update({ status }).eq("id", orderId)
+```
 
 Backfill email on old orders (touches `auth.users`; not auto-run by schema):
 
@@ -409,6 +454,26 @@ where u.id = o.user_id and o.customer_email is null;
 ```
 
 A read-only staff role is **not** implemented. `is_admin()` currently implies catalog writes. Sketch for later: `can_view_orders()` checking `role in ('admin','staff')` on the orders SELECT policy only.
+
+### Users list
+
+The dashboard's Users tab is read-only. It calls:
+
+```js
+supabase.rpc("admin_list_users")
+```
+
+Installed by `supabase/users.sql` (and by a fresh `schema.sql`). The function is
+`SECURITY DEFINER` because `email` and `last_sign_in_at` live in `auth.users`,
+and `profiles` RLS stays own-row only. It returns:
+
+`id`, `username`, `email`, `role`, `profile_image`, `joined_at`,
+`last_sign_in_at`, `order_count`, `total_spent`, `last_order_at`.
+
+`total_spent` counts **Delivered** orders only; pending and cancelled orders
+are not revenue. It raises `42501` for any signed-in caller whose
+`profiles.role` is not `admin`. Role changes remain SQL-only; the tab never
+promotes or deletes accounts.
 
 To restore “any signed-in user may edit catalog”, commented statements live in `supabase/schema.sql` (permissive section). That reopens the catalog to every signup.
 
@@ -469,12 +534,19 @@ Admin products list:
 | Banner missing | no active slides, or no banner and no product photo | `select id, is_active, banner_url from featured_slides;` |
 | Slides in wrong order | stream default sort | `order('display_order', ascending: true)` |
 | Cart/checkout RLS | signed out or wrong user | own-row policies |
+| `new row violates check constraint "orders_status_check"` | old two-value status constraint still installed | run `supabase/order_status.sql` |
+| Admin status change rejected with `42501` | admin UPDATE policy or guard missing | run `supabase/order_status.sql` |
+| Customer can still cancel a Delivered order | old guard function still installed | run `supabase/order_status.sql` |
+| Users tab: `Could not find the public.admin_list_users function` | `users.sql` not run, or PostgREST cache stale | run `supabase/users.sql`, then `notify pgrst, 'reload schema';` |
+| Users tab: `Only an admin can list users.` | signed-in profile role is `customer` | `update public.profiles set role = 'admin' …` |
 
 ---
 
 ## 14. Checklist
 
 - [ ] Ran `supabase/schema.sql`
+- [ ] On an existing database, ran `supabase/order_status.sql` (legacy `Completed` → `Delivered`, four-value CHECK, admin UPDATE policy, new guard/restock triggers)
+- [ ] On an existing database, ran `supabase/users.sql` (admin-gated `admin_list_users()` RPC for the Users tab)
 - [ ] `relreplident` is FULL (`f`) on `cart_items`, `orders`, `featured_slides`
 - [ ] Public buckets `product-images` and `avatars` + four storage policies (subquery form)
 - [ ] Email confirmation off for local testing
@@ -485,8 +557,13 @@ Admin products list:
 - [ ] Admin saves one product with image + stock → appears on storefront grid and “Other Products”
 - [ ] Customer cannot save a product or slide
 - [ ] Add to cart, quantity caps at stock, checkout via `place_order`
-- [ ] Order in Profile → My Orders; cancel works
+- [ ] Order in Profile → My Orders shows Pending / Processing / Delivered / Cancelled with the right colour
+- [ ] Customer can cancel a Pending or Processing order; the app hides Cancel once Delivered
 - [ ] Featured slide with banner opens the linked product
 - [ ] Buy last units; stock drops on both clients; oversell is refused
 - [ ] Admin Orders tab sees every order; customer still sees only their own
+- [ ] Admin moves an order Pending → Processing → Delivered; the app updates live
+- [ ] Admin cancels a Pending order; stock returns once; the row stays Cancelled
+- [ ] Admin cannot reopen a Cancelled order; customer still sees only their own
+- [ ] Admin Users tab lists signups with email, role, order count and delivered spend
 - [ ] `customer_email` backfilled on old orders if needed

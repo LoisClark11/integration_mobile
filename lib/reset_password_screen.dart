@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'gradient_header.dart';
 import 'login_screen.dart';
+import 'session_persistence.dart';
 import 'supabase_service.dart';
 
 class ResetPasswordScreen extends StatefulWidget {
@@ -69,6 +70,7 @@ class _ResetPasswordScreenState extends State<ResetPasswordScreen> {
 
       // Sign out afterwards so the new password is proven by a real
       // sign in, and so no session is left hanging open.
+      await SessionPersistence.clear();
       await SupabaseService.client.auth.signOut();
 
       if (!mounted) return;
@@ -173,10 +175,10 @@ class _ResetPasswordScreenState extends State<ResetPasswordScreen> {
   /// to the login screen to start over.
   Future<void> _cancelRecovery() async {
     try {
+      await SessionPersistence.clear();
       await SupabaseService.client.auth.signOut();
     } catch (_) {
-      // Nothing useful to do if sign out fails; the session is in memory
-      // only and dies with the process anyway.
+      // Nothing useful to do if sign out fails; best-effort cleanup.
     }
 
     if (!mounted) return;

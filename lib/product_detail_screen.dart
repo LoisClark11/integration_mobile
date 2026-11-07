@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
+import 'currency_format.dart';
 import 'gradient_header.dart';
 import 'product_image.dart';
 import 'checkout_screen.dart';
@@ -26,9 +26,6 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
   static const String _noDescription =
       "No description available";
 
-  final NumberFormat _currencyFormatter =
-      NumberFormat('#,##0.00');
-
   bool _addingToCart = false;
 
   /// Both streams are created once in initState. Building them inside
@@ -41,19 +38,13 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
     super.initState();
 
     _productsStream = AppRepository.watchProducts();
-    _productStream =
-        AppRepository.watchProduct(widget.productId);
+    _productStream = AppRepository.watchProduct(widget.productId);
   }
 
-  double _parsePrice(dynamic price) {
-    if (price is num) return price.toDouble();
+  double _parsePrice(dynamic price) => CurrencyFormat.parse(price);
 
-    return double.tryParse(price?.toString() ?? '') ?? 0;
-  }
-
-  String _formatPrice(dynamic price) {
-    return 'PHP ${_currencyFormatter.format(_parsePrice(price))}';
-  }
+  String _formatPrice(dynamic price) =>
+      CurrencyFormat.php(CurrencyFormat.parse(price));
 
   /// Reads the description and falls back to a placeholder when the
   /// field is missing, empty, or null.

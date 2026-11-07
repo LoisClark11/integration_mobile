@@ -32,26 +32,14 @@ class SupabaseService {
 
   /// Initializes the client once, before `runApp`.
   ///
-  /// `persistSession: false` is what makes the app forget a signed in
-  /// user on restart. Left on, Supabase writes the session to shared
-  /// preferences and restores it on the next cold start, so closing and
-  /// reopening the app drops the customer straight back onto the
-  /// products page as somebody who never chose to sign in again.
+  /// `persistSession` is enabled so a signed-in user stays signed in
+  /// across cold starts. Clearing app data removes the stored session,
+  /// and [SessionPersistence] signs the user out if the app has not
+  /// been opened for an extended period.
   ///
-  /// Turning it off swaps that store for `EmptyLocalStorage`, so the
-  /// session lives in memory for as long as the process does and is gone
-  /// the next time the app starts.
-  ///
-  /// `autoRefreshToken: true` keeps that in-memory session valid. An
-  /// access token expires after about an hour; without a refresh every
-  /// query and write starts failing with 401 while the UI still shows
-  /// the customer as signed in. Refreshing only touches the token in
-  /// memory -- nothing is written to disk -- so it does not weaken the
-  /// cold-start-is-signed-out behaviour above.
-  ///
-  /// The password reset link still works. That flow arrives as a deep
-  /// link, and `detectSessionInUri` still exchanges it for a session in
-  /// memory during that run, which is all `ResetPasswordScreen` needs.
+  /// `autoRefreshToken: true` keeps the session valid while the app is
+  /// in use (access tokens expire ~hourly). The password reset deep link
+  /// still works: `detectSessionInUri` exchanges it for a session.
   static Future<void> initialize() async {
     if (_initialized) return;
 
@@ -59,7 +47,7 @@ class SupabaseService {
       url: projectUrl,
       publishableKey: publishableKey,
       authOptions: const FlutterAuthClientOptions(
-        persistSession: false,
+        persistSession: true,
         autoRefreshToken: true,
       ),
     );

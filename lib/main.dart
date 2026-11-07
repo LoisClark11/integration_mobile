@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'login_screen.dart';
 import 'reset_password_screen.dart';
@@ -10,6 +9,8 @@ import 'cart_screen.dart';
 import 'supabase_service.dart';
 import 'app_repository.dart';
 import 'session.dart';
+import 'session_persistence.dart';
+import 'currency_format.dart';
 import 'gradient_header.dart';
 import 'app_footer.dart';
 import 'user_profile_screen.dart';
@@ -36,6 +37,7 @@ Future<void> main() async {
   );
 
   await SupabaseService.initialize();
+  await SessionPersistence.checkAndEnforce();
 
   runApp(const ProductInventoryApp());
 }
@@ -82,13 +84,11 @@ class ProductInventoryApp extends StatelessWidget {
       navigatorKey: navigatorKey,
       scaffoldMessengerKey: scaffoldMessengerKey,
 
-      // Cold start is always signed out: `persistSession: false` means
-      // the session lives only in memory, so there is nothing to restore
-      // on a fresh launch. A hot restart can keep the in-memory session
-      // for the life of the process, but a real cold start lands on the
-      // signed-out products page -- after the splash's short brand
-      // moment. The password-reset deep link skips the splash entirely
-      // (see onUnknownRoute below) so recovery is never delayed.
+      // Session is persisted across restarts (see SupabaseService /
+      // SessionPersistence). A restored, non-expired session means the
+      // user stays signed in; clearing app data or extended inactivity
+      // signs them out. The password-reset deep link skips the splash
+      // entirely (see onUnknownRoute below) so recovery is never delayed.
       home: const SplashScreen(),
 
       // Android hands deep links to Flutter as named routes, so the
@@ -321,13 +321,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
   /// Whether the footer has slid out of view after scrolling down.
   bool _footerHidden = false;
 
-  /// Created once in initState rather than inside build, so the
-  /// realtime subscription is not torn down on every rebuild.
-  late final Stream<List<Map<String, dynamic>>> _productsStream;
+  /// Single source of catalog data for both the grid and the featured
+  /// carousel fallbacks (avoids duplicate realtime subscriptions).
+  List<Map<String, dynamic>> _products = const [];
+  Map<String, Map<String, dynamic>> _productsById = const {};
+  Object? _productsError;
+  bool _productsLoading = true;
+  StreamSubscription<List<Map<String, dynamic>>>? _productsSub;
 
-  /// Same rule as above. One subscription per stream, never a new one
-  /// built during `build`.
-  late final Stream<List<Map<String, dynamic>>> _featuredSlidesStream;
+  /// Featured slides stream; recreated on pull-to-refresh.
+  late Stream<List<Map<String, dynamic>>> _featuredSlidesStream;
 
   /// Cached rather than read from `AppSession` during `build`, because
   /// that getter only ever sees the client. Without a listener the
@@ -341,7 +344,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   void initState() {
     super.initState();
 
-    _productsStream = AppRepository.watchProducts();
+    _bindProducts();
     _featuredSlidesStream = AppRepository.watchFeaturedSlides();
 
     // Seeds the button before the first auth event arrives.
@@ -368,10 +371,72 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _scrollController.addListener(_onScroll);
   }
 
+  void _bindProducts() {
+    _productsSub?.cancel();
+    _productsSub = AppRepository.watchProducts().listen(
+      (products) {
+        if (!mounted) return;
+        setState(() {
+          _products = products;
+          _productsById = {
+            for (final p in products)
+              if (p['id'] != null) p['id'].toString(): p,
+          };
+          _productsLoading = false;
+          _productsError = null;
+        });
+      },
+      onError: (Object error) {
+        if (!mounted) return;
+        setState(() {
+          _productsLoading = false;
+          _productsError = error;
+        });
+      },
+    );
+  }
+
+  /// Pull-to-refresh: rebind realtime streams and do a light one-shot
+  /// fetch so the gesture has visible feedback even when realtime is
+  /// already up to date.
+  Future<void> _reload() async {
+    setState(() {
+      _productsLoading = _products.isEmpty;
+      _featuredSlidesStream = AppRepository.watchFeaturedSlides();
+    });
+    _bindProducts();
+    try {
+      final results = await Future.wait([
+        SupabaseService.client.from('products').select().order('created_at'),
+        SupabaseService.client
+            .from('featured_slides')
+            .select()
+            .eq('is_active', true)
+            .order('display_order', ascending: true),
+      ]);
+      final products = (results[0] as List)
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        _products = products;
+        _productsById = {
+          for (final p in products)
+            if (p['id'] != null) p['id'].toString(): p,
+        };
+        _productsLoading = false;
+        _productsError = null;
+      });
+    } catch (_) {
+      // Keep showing stream-backed state; errors surface via listeners.
+    }
+  }
+
   @override
   void dispose() {
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
+    _productsSub?.cancel();
     _authSubscription?.cancel();
     super.dispose();
   }
@@ -405,16 +470,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
         builder: (context) => const LoginScreen(),
       ),
     );
-  }
-
-  final NumberFormat _currencyFormatter =
-      NumberFormat('#,##0.00');
-
-  String _formatPrice(dynamic price) {
-    final parsedPrice =
-        double.tryParse(price?.toString() ?? '') ?? 0;
-
-    return 'PHP ${_currencyFormatter.format(parsedPrice)}';
   }
 
   Future<void> _addToCart(Map<String, dynamic> product) async {
@@ -456,7 +511,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       await AppRepository.addToCart(
         productId,
         name: product["name"]?.toString() ?? "Unnamed Product",
-        price: _parsePrice(product["price"]),
+        price: CurrencyFormat.parse(product["price"]),
         imageUrl: product["image_url"]?.toString(),
       );
 
@@ -474,12 +529,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
         SnackBar(content: Text("Could not add to cart: $e")),
       );
     }
-  }
-
-  double _parsePrice(dynamic price) {
-    if (price is num) return price.toDouble();
-
-    return double.tryParse(price?.toString() ?? '') ?? 0;
   }
 
   Widget _buildProductImage(Map<String, dynamic> product, int? stock) {
@@ -626,7 +675,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     alignment: Alignment.centerLeft,
 
                     child: Text(
-                      _formatPrice(product["price"]),
+                      CurrencyFormat.php(
+                        CurrencyFormat.parse(product["price"]),
+                      ),
                       maxLines: 1,
                       style: const TextStyle(
                         color: Color(0xFFC25E7A),
@@ -712,7 +763,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
         // nothing to show, so the page simply continues.
         if (slides.isEmpty) return const SizedBox.shrink();
 
-        return FeaturedSlidesCarousel(slides: slides);
+        return FeaturedSlidesCarousel(
+          slides: slides,
+          productsById: _productsById,
+        );
       },
     );
   }
@@ -805,8 +859,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
   /// Scrolling back to the top restores the natural order -- header,
   /// banners, chips, catalog.
   Widget _buildProductsPage() {
-    return CustomScrollView(
+    final content = CustomScrollView(
       controller: _scrollController,
+      physics: const AlwaysScrollableScrollPhysics(),
 
       slivers: [
         // Hides itself while scrolling down and slides back over the
@@ -915,164 +970,130 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
         ),
 
-        // The catalog itself. The StreamBuilder sits directly in the
-        // sliver list and every state below returns a sliver, so
-        // loading, error, empty and the grid all live inside this one
-        // scroll surface.
-        StreamBuilder<List<Map<String, dynamic>>>(
-          stream: _productsStream,
-
-          builder: (context, snapshot) {
-            if (snapshot.connectionState == ConnectionState.waiting) {
-              return const SliverFillRemaining(
-                hasScrollBody: false,
-
-                child: Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-
-                    children: [
-                      CircularProgressIndicator(
-                        color: Color(0xFFC25E7A),
-                        strokeWidth: 2.5,
-                        backgroundColor: Color(0xFFFCEBEF),
-                      ),
-
-                      SizedBox(height: 14),
-
-                      Text(
-                        "Loading products…",
-                        style: TextStyle(
-                          color: Colors.grey,
-                          fontSize: 13,
-                        ),
-                      ),
-                    ],
+        // The catalog itself, fed by the screen's single products
+        // subscription (shared with featured fallbacks). Every state
+        // below returns a sliver so loading/error/empty/grid live in
+        // this one scroll surface.
+        if (_productsLoading && _products.isEmpty)
+          const SliverFillRemaining(
+            hasScrollBody: false,
+            child: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(
+                    color: Color(0xFFC25E7A),
+                    strokeWidth: 2.5,
+                    backgroundColor: Color(0xFFFCEBEF),
                   ),
-                ),
-              );
-            }
-
-            final products = snapshot.data ?? const [];
-
-            if (snapshot.hasError) {
-              return SliverFillRemaining(
-                hasScrollBody: false,
-
-                child: Center(
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
-                    child: Text(
-                      "Could not load products.\n${snapshot.error}",
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(color: Colors.grey),
-                    ),
+                  SizedBox(height: 14),
+                  Text(
+                    "Loading products…",
+                    style: TextStyle(color: Colors.grey, fontSize: 13),
                   ),
-                ),
-              );
-            }
-
-            if (products.isEmpty) {
-              return const SliverFillRemaining(
-                hasScrollBody: false,
-
-                child: Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-
-                    children: [
-                      Icon(
-                        Icons.spa_rounded,
-                        size: 70,
-                        color: Colors.grey,
-                      ),
-
-                      SizedBox(height: 14),
-
-                      Text(
-                        "No products available.",
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-
-                      SizedBox(height: 6),
-
-                      Text(
-                        "Products will appear here once added by admin.",
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.grey),
-                      ),
-                    ],
-                  ),
-                ),
-              );
-            }
-
-            // The chosen category narrows the catalog in memory.
-            // Products the admin has not categorised yet (null
-            // category) show under "All Products" and no other chip.
-            final visibleProducts = _selectedCategory ==
-                    kAllProductsCategory
-                ? products
-                : products
-                    .where(
-                      (product) =>
-                          product['category'] == _selectedCategory,
-                    )
-                    .toList();
-
-            if (visibleProducts.isEmpty) {
-              return const SliverFillRemaining(
-                hasScrollBody: false,
-
-                child: Center(
-                  child: Padding(
-                    padding: EdgeInsets.all(24),
-                    child: Text(
-                      "No products in this category yet.",
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.grey),
-                    ),
-                  ),
-                ),
-              );
-            }
-
-            // The footer overlays the bottom of the page (Scaffold
-            // extendBody), so the last row needs enough trailing
-            // space to scroll clear of it: the NavigationBar's 68px
-            // plus the home-indicator inset its SafeArea reserves,
-            // on top of the original 20px of breathing room.
-            return SliverPadding(
-              padding: EdgeInsets.fromLTRB(
-                16,
-                6,
-                16,
-                20 + 68 + MediaQuery.of(context).padding.bottom,
+                ],
               ),
-
-              sliver: SliverGrid(
-                gridDelegate:
-                    const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 2,
-                  crossAxisSpacing: 14,
-                  mainAxisSpacing: 14,
-                  childAspectRatio: 0.62,
-                ),
-
-                delegate: SliverChildBuilderDelegate(
-                  (context, index) {
-                    return _buildProductCard(visibleProducts[index]);
-                  },
-                  childCount: visibleProducts.length,
+            ),
+          )
+        else if (_productsError != null && _products.isEmpty)
+          SliverFillRemaining(
+            hasScrollBody: false,
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text(
+                  "Could not load products.\n$_productsError",
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.grey),
                 ),
               ),
-            );
-          },
-        ),
+            ),
+          )
+        else if (_products.isEmpty)
+          const SliverFillRemaining(
+            hasScrollBody: false,
+            child: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.spa_rounded, size: 70, color: Colors.grey),
+                  SizedBox(height: 14),
+                  Text(
+                    "No products available.",
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  SizedBox(height: 6),
+                  Text(
+                    "Products will appear here once added by admin.",
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.grey),
+                  ),
+                ],
+              ),
+            ),
+          )
+        else if ((_selectedCategory == kAllProductsCategory
+                ? _products
+                : _products
+                    .where((p) => p['category'] == _selectedCategory)
+                    .toList())
+            .isEmpty)
+          const SliverFillRemaining(
+            hasScrollBody: false,
+            child: Center(
+              child: Padding(
+                padding: EdgeInsets.all(24),
+                child: Text(
+                  "No products in this category yet.",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.grey),
+                ),
+              ),
+            ),
+          )
+        else
+          SliverPadding(
+            padding: EdgeInsets.fromLTRB(
+              16,
+              6,
+              16,
+              20 + 68 + MediaQuery.of(context).padding.bottom,
+            ),
+            sliver: SliverGrid(
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 2,
+                crossAxisSpacing: 14,
+                mainAxisSpacing: 14,
+                childAspectRatio: 0.62,
+              ),
+              delegate: SliverChildBuilderDelegate(
+                (context, index) {
+                  final visibleProducts =
+                      _selectedCategory == kAllProductsCategory
+                          ? _products
+                          : _products
+                              .where(
+                                (p) => p['category'] == _selectedCategory,
+                              )
+                              .toList();
+                  return _buildProductCard(visibleProducts[index]);
+                },
+                childCount: (_selectedCategory == kAllProductsCategory
+                        ? _products
+                        : _products
+                            .where((p) => p['category'] == _selectedCategory)
+                            .toList())
+                    .length,
+              ),
+            ),
+          ),
       ],
+    );
+
+    return RefreshIndicator(
+      color: const Color(0xFFC25E7A),
+      onRefresh: _reload,
+      child: content,
     );
   }
 

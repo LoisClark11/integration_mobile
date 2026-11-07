@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'main.dart';
 import 'session.dart';
+import 'session_persistence.dart';
 import 'create_account_screen.dart';
 import 'forgot_password_screen.dart';
 
@@ -68,6 +69,8 @@ class _LoginScreenState extends State<LoginScreen> {
           'Sign in did not complete. Please try again.',
         );
       }
+
+      await SessionPersistence.markActive();
 
       // Usually LoginScreen was pushed on top of the home Dashboard (the
       // header's Log In button, or the profile tab). Popping back to it

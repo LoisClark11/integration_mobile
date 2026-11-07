@@ -164,7 +164,7 @@ alter table public.cart_items
   add column if not exists image_url text;
 
 
--- Completed and cancelled orders.
+-- Pending, processing, delivered and cancelled orders.
 create table if not exists public.orders (
   id               uuid primary key default gen_random_uuid(),
   user_id          uuid not null references auth.users (id) on delete cascade,
@@ -192,9 +192,14 @@ create table if not exists public.orders (
   -- product is later renamed, repriced, or deleted.
   items            jsonb         not null default '[]'::jsonb,
 
-  -- 'Completed' | 'Cancelled'
-  status           text          not null default 'Completed'
-                     check (status in ('Completed', 'Cancelled')),
+  -- 'Pending' | 'Processing' | 'Delivered' | 'Cancelled'
+  --
+  -- Pending is the default at checkout. An admin moves the order through
+  -- Processing and Delivered. Either side may cancel, but only while the
+  -- order is still Pending or Processing -- Delivered and Cancelled are
+  -- final states.
+  status           text          not null default 'Pending'
+                     check (status in ('Pending', 'Processing', 'Delivered', 'Cancelled')),
 
   -- 'Cart' | 'Buy Now'
   purchase_type    text,
@@ -225,6 +230,40 @@ alter table public.orders
   add column if not exists purchase_type text;
 alter table public.orders
   add column if not exists cancelled_at timestamptz;
+
+
+-- ---------------------------------------------------------------------------
+-- 1a-bis. ORDER STATUS MIGRATION (fresh and existing databases)
+--
+-- `create table if not exists` above is a no-op on a project that already
+-- has `orders`, so the old two-value CHECK would otherwise survive and
+-- reject the new 'Pending' default. Drop the guard first: the backfill
+-- changes status, and the previous guard only permits a move to
+-- 'Cancelled'. Section 2 recreates the guard with the new rules.
+-- ---------------------------------------------------------------------------
+
+drop trigger if exists guard_order_update on public.orders;
+
+alter table public.orders
+  drop constraint if exists orders_status_check;
+
+-- 'Completed' was the old final state, so keep those orders closed.
+update public.orders
+   set status = 'Delivered'
+ where status = 'Completed';
+
+-- Anything unexpected must not block the new constraint.
+update public.orders
+   set status = 'Pending'
+ where status is null
+    or status not in ('Pending', 'Processing', 'Delivered', 'Cancelled');
+
+alter table public.orders
+  alter column status set default 'Pending';
+
+alter table public.orders
+  add constraint orders_status_check
+  check (status in ('Pending', 'Processing', 'Delivered', 'Cancelled'));
 
 
 -- ---------------------------------------------------------------------------
@@ -468,6 +507,72 @@ revoke all on function public.is_admin() from public, anon, authenticated, servi
 grant execute on function public.is_admin() to authenticated;
 
 
+-- ---------------------------------------------------------------------------
+-- Users list for the admin dashboard
+--
+-- Email and last_sign_in_at live in auth.users, which the publishable key
+-- cannot read. This SECURITY DEFINER function is the narrow door: it returns
+-- only the columns the dashboard needs, and only to an admin.
+--
+-- `profiles` RLS stays own-row only. The dashboard never selects it directly;
+-- it calls this function instead. The order totals are computed here so the
+-- Users tab stays correct without downloading every order a second time.
+--
+-- The SQL editor has no JWT, so auth.uid() is null there. That is the trusted
+-- path used to verify the function; an API caller always carries a JWT and is
+-- therefore checked. This mirrors guard_profile_role().
+-- ---------------------------------------------------------------------------
+create or replace function public.admin_list_users()
+returns table (
+  id              uuid,
+  username        text,
+  email           text,
+  role            text,
+  profile_image   text,
+  joined_at       timestamptz,
+  last_sign_in_at timestamptz,
+  order_count     bigint,
+  total_spent     numeric,
+  last_order_at   timestamptz
+)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is not null and not public.is_admin() then
+    raise exception 'Only an admin can list users.'
+      using errcode = '42501';
+  end if;
+
+  return query
+  select
+    u.id,
+    coalesce(p.username, split_part(u.email, '@', 1)) as username,
+    u.email,
+    coalesce(p.role, 'customer') as role,
+    p.profile_image,
+    u.created_at as joined_at,
+    u.last_sign_in_at,
+    count(o.id) as order_count,
+    -- Only delivered orders count as money spent; pending and cancelled
+    -- orders are not revenue yet.
+    coalesce(sum(o.total_amount) filter (where o.status = 'Delivered'), 0) as total_spent,
+    max(o.created_at) as last_order_at
+  from auth.users u
+  left join public.profiles p on p.id = u.id
+  left join public.orders o on o.user_id = u.id
+  group by u.id, u.email, u.created_at, u.last_sign_in_at,
+           p.username, p.role, p.profile_image
+  order by u.created_at desc;
+end;
+$$;
+
+revoke all on function public.admin_list_users() from public, anon, authenticated, service_role;
+grant execute on function public.admin_list_users() to authenticated;
+
+
 -- ============================================================================
 -- 2. ROW LEVEL SECURITY
 --
@@ -699,8 +804,9 @@ create policy "users can delete own cart items"
 -- trade for not having to manage a second role. See ADMIN_INTEGRATION.md
 -- section 6a.
 --
--- SELECT only. Admins can read the order log but cannot edit it, so a
--- mistake in the dashboard cannot rewrite someone's history.
+-- Admins can read every order. They may also UPDATE one, but only the
+-- status/cancelled_at columns -- guard_order_update() below freezes the
+-- rest of the row, so the dashboard cannot rewrite a customer's history.
 
 drop policy if exists "users can read own orders" on public.orders;
 create policy "users can read own orders"
@@ -713,6 +819,13 @@ create policy "admins can read all orders"
   on public.orders for select
   to authenticated
   using (public.is_admin());
+
+drop policy if exists "admins can update all orders" on public.orders;
+create policy "admins can update all orders"
+  on public.orders for update
+  to authenticated
+  using (public.is_admin())
+  with check (public.is_admin());
 
 drop policy if exists "users can create own orders" on public.orders;
 -- Intentionally NOT recreated. Orders are written only by place_order(),
@@ -729,11 +842,20 @@ create policy "users can cancel own orders"
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
 
--- The UPDATE policy above pins the row to its owner but still lets the
--- owner rewrite any column on it -- total_amount, items, customer_email,
--- even status back to 'Completed'. This trigger narrows that down to
--- what the app actually does: a customer may move their own order to
--- 'Cancelled' and stamp cancelled_at, and change nothing else.
+-- The UPDATE policies above decide WHO may touch a row. This trigger
+-- decides WHAT may change on it:
+--
+--   * an admin may move the order between Pending, Processing and
+--     Delivered, or cancel it;
+--   * a customer may only move their own order to Cancelled, and only
+--     while it is still Pending or Processing;
+--   * Delivered is final except for cancellation; Cancelled is final for
+--     everybody. Nothing can be reopened, which also keeps
+--     restock_on_cancel() from putting the same units back twice;
+--   * every other column is history and must not be rewritten.
+--
+-- cancelled_at is derived here rather than trusted from the client, so
+-- the app and the dashboard cannot disagree about when it happened.
 --
 -- SECURITY DEFINER so the guard can read the stored row's full contents
 -- regardless of the caller's row-level read access.
@@ -743,21 +865,10 @@ language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  v_is_admin boolean := public.is_admin();
 begin
-  if new.status is distinct from old.status
-     or new.cancelled_at is distinct from old.cancelled_at then
-    if new.status <> 'Cancelled' then
-      raise exception 'An order can only be cancelled, not set to "%" or edited.',
-        new.status using errcode = '42501';
-    end if;
-
-    -- Once cancelled, an order is frozen.
-    if old.status = 'Cancelled' then
-      return old;
-    end if;
-  end if;
-
-  -- Everything else on the row is history and must not be rewritten.
+  -- Everything except status / cancelled_at is history.
   if new.id                is distinct from old.id
      or new.user_id        is distinct from old.user_id
      or new.customer_name  is distinct from old.customer_name
@@ -771,8 +882,47 @@ begin
      or new.items          is distinct from old.items
      or new.purchase_type  is distinct from old.purchase_type
      or new.created_at     is distinct from old.created_at then
-    raise exception 'An order cannot be edited after it is placed. Only its status may change to Cancelled.'
+    raise exception 'An order cannot be edited after it is placed. Only its status may change.'
       using errcode = '42501';
+  end if;
+
+  if new.status is distinct from old.status then
+    -- Cancelled is final for everybody.
+    if old.status = 'Cancelled' then
+      raise exception 'A cancelled order cannot be changed.'
+        using errcode = '42501';
+    end if;
+
+    if v_is_admin then
+      if new.status not in ('Pending', 'Processing', 'Delivered', 'Cancelled') then
+        raise exception 'Unknown order status "%".', new.status
+          using errcode = '22023';
+      end if;
+
+      -- Delivered is final except for cancellation. Reopening it would let
+      -- a later cancel restock units that already left the shop.
+      if old.status = 'Delivered' and new.status <> 'Cancelled' then
+        raise exception 'A delivered order can only be cancelled, not moved back to "%".',
+          new.status using errcode = '42501';
+      end if;
+    else
+      if new.status <> 'Cancelled' then
+        raise exception 'Only an admin can set the order status to "%".', new.status
+          using errcode = '42501';
+      end if;
+
+      if old.status not in ('Pending', 'Processing') then
+        raise exception 'This order can no longer be cancelled.'
+          using errcode = '42501';
+      end if;
+    end if;
+  end if;
+
+  -- Derive the timestamp instead of accepting whatever the client sent.
+  if new.status = 'Cancelled' then
+    new.cancelled_at := coalesce(old.cancelled_at, now());
+  else
+    new.cancelled_at := old.cancelled_at;
   end if;
 
   return new;
@@ -787,12 +937,14 @@ create trigger guard_order_update
 -- Cancelling an order used to retire its stock forever: place_order()
 -- took the units, but nothing ever gave them back, so a cancelled order
 -- permanently shrank inventory. This puts them back exactly once, on the
--- transition into 'Cancelled'.
+-- transition from Pending/Processing into 'Cancelled'.
 --
--- `old.status <> 'Cancelled'` is what makes it once-only: re-saving an
--- already-cancelled order does not restock a second time. SECURITY
--- DEFINER because the customer cancelling cannot UPDATE products under
--- their own policies.
+-- Delivered is deliberately excluded: those units left the shop, so
+-- cancelling a delivered order afterwards must not inflate inventory.
+-- The transition test is also what makes this once-only -- Cancelled is
+-- final in guard_order_update(), so the same units cannot come back
+-- twice. SECURITY DEFINER because the customer cancelling cannot UPDATE
+-- products under their own policies.
 create or replace function public.restock_on_cancel()
 returns trigger
 language plpgsql
@@ -804,7 +956,7 @@ declare
   v_product_id uuid;
   v_quantity   integer;
 begin
-  if new.status = 'Cancelled' and old.status <> 'Cancelled' then
+  if new.status = 'Cancelled' and old.status in ('Pending', 'Processing') then
     for v_item in select * from jsonb_array_elements(new.items)
     loop
       v_product_id := nullif(v_item ->> 'productId', '')::uuid;
@@ -1007,7 +1159,7 @@ begin
     p_item_count,
     p_items,
     p_purchase_type,
-    'Completed'
+    'Pending'
   )
   returning id into v_order_id;
 
@@ -1186,6 +1338,9 @@ create policy "users delete own avatar"
 -- place_order() is NOT revoked: it is the storefront's checkout RPC
 -- and must stay callable by authenticated. That linter warning is
 -- accepted on purpose (section 2b).
+--
+-- admin_list_users() is also left callable by authenticated: it is the
+-- dashboard's Users RPC, and the function checks is_admin() itself.
 --
 -- handle_new_user() is also revoked, but it lives in section 3 --
 -- revoking a function that does not exist yet aborts a fresh run, so
@@ -1379,3 +1534,9 @@ end $$;
 -- create policy "signed in users can delete featured slides"
 --   on public.featured_slides for delete to authenticated
 --   using (true);
+
+-- PostgREST caches the table shape and the function list. The earlier notify
+-- covers the featured-slides column; this final one guarantees objects added
+-- later in this file -- including admin_list_users() -- are visible to the
+-- dashboard immediately, even if the SQL editor ran each statement on its own.
+notify pgrst, 'reload schema';

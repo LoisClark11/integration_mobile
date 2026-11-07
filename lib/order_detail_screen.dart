@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'currency_format.dart';
 import 'gradient_header.dart';
 import 'app_repository.dart';
+import 'order_status.dart';
 
 class OrderDetailScreen extends StatefulWidget {
   const OrderDetailScreen({
@@ -17,9 +19,6 @@ class OrderDetailScreen extends StatefulWidget {
 }
 
 class _OrderDetailScreenState extends State<OrderDetailScreen> {
-  final NumberFormat _currencyFormatter =
-      NumberFormat('#,##0.00');
-
   bool _cancelling = false;
 
   /// Created once in initState so the realtime subscription is not
@@ -33,15 +32,8 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
     _orderStream = AppRepository.watchOrder(widget.orderId);
   }
 
-  double _parseAmount(dynamic amount) {
-    if (amount is num) return amount.toDouble();
-
-    return double.tryParse(amount?.toString() ?? '') ?? 0;
-  }
-
-  String _formatCurrency(dynamic amount) {
-    return 'PHP ${_currencyFormatter.format(_parseAmount(amount))}';
-  }
+  String _formatCurrency(dynamic amount) =>
+      CurrencyFormat.php(CurrencyFormat.parse(amount));
 
   String _readDate(dynamic createdAt) {
     if (createdAt is! String || createdAt.isEmpty) {
@@ -53,10 +45,6 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
     if (parsed == null) return "Date unavailable";
 
     return DateFormat("MMM d, yyyy - h:mm a").format(parsed.toLocal());
-  }
-
-  bool _isCancelled(Map<String, dynamic> order) {
-    return order["status"]?.toString().toLowerCase() == "cancelled";
   }
 
   Future<void> _cancelOrder() async {
@@ -383,10 +371,43 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
     }
   }
 
-  Widget _buildActionButton(bool isCancelled) {
-    // A cancelled order can be deleted outright. An active order
-    // can only be cancelled.
-    final bool isDeleteMode = isCancelled;
+  Widget _buildActionButton(OrderStatus status) {
+    // Delivered orders are closed: nothing left to cancel.
+    if (!status.isCancelled && !status.canCustomerCancel) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(14),
+
+        decoration: BoxDecoration(
+          color: status.background,
+          borderRadius: BorderRadius.circular(14),
+        ),
+
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.lock_rounded, size: 18, color: status.color),
+
+            const SizedBox(width: 8),
+
+            Flexible(
+              child: Text(
+                "This order has been delivered and can no longer be cancelled.",
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: status.color,
+                  fontSize: 12,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // A cancelled order can be deleted outright. A pending or
+    // processing order can only be cancelled.
+    final bool isDeleteMode = status.isCancelled;
 
     return SizedBox(
       width: double.infinity,
@@ -489,18 +510,19 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
             );
           }
 
-          final isCancelled = _isCancelled(order);
-
-          final status = isCancelled
-              ? "Cancelled"
-              : (order["status"]?.toString() ?? "Completed");
+          final status = readOrderStatus(order["status"]);
+          final isCancelled = status.isCancelled;
 
           return Column(
             children: [
               GradientHeader(
                 toolbarTitle: "Order Details",
                 headerTitle: "Order Summary",
-                subtitle: "Review or cancel this order.",
+                subtitle: isCancelled
+                    ? "This order was cancelled."
+                    : (status.canCustomerCancel
+                        ? "Review or cancel this order."
+                        : "This order has been delivered."),
                 icon: Icons.receipt_long_rounded,
                 showBackButton: true,
               ),
@@ -519,34 +541,48 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
                         padding: const EdgeInsets.all(16),
 
                         decoration: BoxDecoration(
-                          color: isCancelled
-                              ? const Color(0xFFFDECEA)
-                              : const Color(0xFFE8F5E9),
+                          color: status.background,
                           borderRadius:
                               BorderRadius.circular(18),
                         ),
 
                         child: Row(
+                          crossAxisAlignment:
+                              CrossAxisAlignment.start,
                           children: [
                             Icon(
-                              isCancelled
-                                  ? Icons.cancel_rounded
-                                  : Icons.check_circle_rounded,
-                              color: isCancelled
-                                  ? Colors.redAccent
-                                  : const Color(0xFF2E7D32),
+                              status.icon,
+                              color: status.color,
                             ),
 
                             const SizedBox(width: 10),
 
-                            Text(
-                              status,
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 16,
-                                color: isCancelled
-                                    ? Colors.redAccent
-                                    : const Color(0xFF2E7D32),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment:
+                                    CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    status.label,
+                                    style: TextStyle(
+                                      fontWeight:
+                                          FontWeight.bold,
+                                      fontSize: 16,
+                                      color: status.color,
+                                    ),
+                                  ),
+
+                                  const SizedBox(height: 4),
+
+                                  Text(
+                                    status.description,
+                                    style: TextStyle(
+                                      color: status.color,
+                                      fontSize: 12,
+                                      height: 1.35,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ],
@@ -623,6 +659,13 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
                               "Order ID",
                               widget.orderId,
                             ),
+
+                            if (isCancelled &&
+                                order["cancelled_at"] != null)
+                              _buildDetailRow(
+                                "Cancelled",
+                                _readDate(order["cancelled_at"]),
+                              ),
                           ],
                         ),
                       ),
@@ -702,8 +745,8 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
 
                       const SizedBox(height: 18),
 
-                      // Cancel button
-                      _buildActionButton(isCancelled),
+                      // Cancel / delete action
+                      _buildActionButton(status),
 
                       const SizedBox(height: 20),
                     ],

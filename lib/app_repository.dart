@@ -238,14 +238,26 @@ class AppRepository {
 
     if (userId == null) return;
 
-    await _client
+    // `.select()` is what proves a row was actually changed. Without it
+    // PostgREST reports success even when the RLS policy matched nothing,
+    // and the screen would claim the order was cancelled when it was not.
+    // The database guard still rejects a Delivered order with a 42501
+    // PostgrestException, which the screen shows as-is.
+    final rows = await _client
         .from('orders')
         .update({
           'status': 'Cancelled',
           'cancelled_at': DateTime.now().toUtc().toIso8601String(),
         })
         .eq('id', orderId)
-        .eq('user_id', userId);
+        .eq('user_id', userId)
+        .select('id');
+
+    if (rows.isEmpty) {
+      throw Exception(
+        'This order can no longer be cancelled. It may already be delivered.',
+      );
+    }
   }
 
   static Future<void> deleteOrder(String orderId) async {
@@ -253,11 +265,16 @@ class AppRepository {
 
     if (userId == null) return;
 
-    await _client
+    final rows = await _client
         .from('orders')
         .delete()
         .eq('id', orderId)
-        .eq('user_id', userId);
+        .eq('user_id', userId)
+        .select('id');
+
+    if (rows.isEmpty) {
+      throw Exception('This order could not be deleted.');
+    }
   }
 
   // ======================================================================

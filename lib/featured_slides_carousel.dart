@@ -2,35 +2,36 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
 
-import 'app_repository.dart';
+import 'currency_format.dart';
 import 'featured_slide.dart';
 import 'product_detail_screen.dart';
 import 'product_image.dart';
 
 /// Edge to edge banner carousel that sits above the product grid.
 ///
-/// Every slide carries the two pictures the admin uploaded:
-///
-///   - `banner_url` is the wide featured picture. It fills the slide
-///     from the left edge to the right edge, which is what makes the
-///     row read as a banner rather than another product card.
-///   - `item_image_url` is the shot of the item itself, floated on top
-///     of the banner on the right so the customer can tell what is
-///     actually for sale.
+/// Each slide uploads one wide picture, `banner_url`, which fills the
+/// slide from edge to edge so the row reads as a banner rather than
+/// another product card. The advertised item is a real catalog product;
+/// when the slide leaves copy or its banner blank, values fall back to
+/// that product, and tapping the slide opens the linked product.
 ///
 /// Slides advance by themselves, respond to a swipe, and show dot
-/// indicators. Tapping a slide opens the linked product, when the admin
-/// set `product_id`.
+/// indicators.
 class FeaturedSlidesCarousel extends StatefulWidget {
   const FeaturedSlidesCarousel({
     super.key,
     required this.slides,
+    this.productsById = const {},
   });
 
   /// Rows from the `featured_slides` table, in carousel order.
   final List<Map<String, dynamic>> slides;
+
+  /// Catalog rows keyed by id, used to fill in item name, price and
+  /// banner fallbacks for slides that left those fields blank. Provided
+  /// by the parent so the screen keeps a single products subscription.
+  final Map<String, Map<String, dynamic>> productsById;
 
   /// Height of the banner band for the current screen width.
   ///
@@ -81,12 +82,6 @@ class _FeaturedSlidesCarouselState extends State<FeaturedSlidesCarousel> {
   /// catalog lookup below brings in new data.
   List<Map<String, dynamic>> _rows = const [];
 
-  /// Catalog rows keyed by id, used only to fill in the item name,
-  /// price and picture a slide left blank.
-  Map<String, Map<String, dynamic>> _productsById = const {};
-
-  StreamSubscription<List<Map<String, dynamic>>>? _productSubscription;
-
   int _currentIndex = 0;
 
   Timer? _autoAdvanceTimer;
@@ -96,29 +91,8 @@ class _FeaturedSlidesCarouselState extends State<FeaturedSlidesCarousel> {
     super.initState();
 
     _rows = widget.slides;
-
     _rebuildSlides();
-
     _restartAutoAdvance();
-
-    // A slide carries its own copy of the item name, price and picture,
-    // so the catalog is only a fallback for the slides that left those
-    // blank and simply point at a product.
-    //
-    // Both failure modes are absorbed on purpose, because the banners
-    // must never be dragged down by the optional lookup. A refused or
-    // dropped subscription arrives as a stream error, and a client that
-    // never finished starting throws straight out of `watchProducts`;
-    // either way the slides keep rendering from their own fields.
-    try {
-      _productSubscription = AppRepository.watchProducts().listen(
-        _onProducts,
-        onError: (Object _) {},
-      );
-    } catch (_) {
-      // No catalog available. Slides that filled in their own fields are
-      // unaffected, which is exactly what storing them on the row is for.
-    }
   }
 
   @override
@@ -126,12 +100,12 @@ class _FeaturedSlidesCarouselState extends State<FeaturedSlidesCarousel> {
     super.didUpdateWidget(oldWidget);
 
     // The admin can add, edit or deactivate a slide while the page is
-    // open, because the list is a realtime subscription. No setState is
-    // needed here: this runs as part of a rebuild that is already
-    // happening.
-    if (oldWidget.slides != widget.slides) {
+    // open, because the list is a realtime subscription. Product data is
+    // owned by the parent and passed in so the screen keeps a single
+    // catalog subscription.
+    if (oldWidget.slides != widget.slides ||
+        oldWidget.productsById != widget.productsById) {
       _rows = widget.slides;
-
       _rebuildSlides();
       _restartAutoAdvance();
     }
@@ -140,7 +114,6 @@ class _FeaturedSlidesCarouselState extends State<FeaturedSlidesCarousel> {
   @override
   void dispose() {
     _autoAdvanceTimer?.cancel();
-    _productSubscription?.cancel();
     _controller.dispose();
     super.dispose();
   }
@@ -149,7 +122,7 @@ class _FeaturedSlidesCarouselState extends State<FeaturedSlidesCarousel> {
   /// [_currentIndex] pointing at something real.
   void _rebuildSlides() {
     _slides = _rows
-        .map((row) => FeaturedSlide.fromRow(row, _productsById))
+        .map((row) => FeaturedSlide.fromRow(row, widget.productsById))
         .where((slide) => slide.isRenderable)
         .toList();
 
@@ -168,19 +141,6 @@ class _FeaturedSlidesCarouselState extends State<FeaturedSlidesCarousel> {
 
       _controller.jumpToPage(_currentIndex);
     });
-  }
-
-  void _onProducts(List<Map<String, dynamic>> products) {
-    _productsById = {
-      for (final product in products)
-        if (product['id'] != null) product['id'].toString(): product,
-    };
-
-    _rebuildSlides();
-
-    if (!mounted) return;
-
-    setState(() {});
   }
 
   void _restartAutoAdvance() {
@@ -531,7 +491,7 @@ class _FeaturedSlidesCarouselState extends State<FeaturedSlidesCarousel> {
         if (slide.itemPrice != null)
           Flexible(
             child: Text(
-              _formatPrice(slide.itemPrice!),
+              CurrencyFormat.php(slide.itemPrice!),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
 
@@ -741,9 +701,7 @@ class _FeaturedSlidesCarouselState extends State<FeaturedSlidesCarousel> {
     );
   }
 
-  String _formatPrice(double price) {
-    return 'PHP ${NumberFormat('#,##0.00').format(price)}';
-  }
+
 
   @override
   Widget build(BuildContext context) {

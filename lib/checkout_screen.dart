@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'currency_format.dart';
 import 'session.dart';
 import 'app_repository.dart';
 import 'supabase_service.dart';
@@ -56,9 +56,6 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
 
   static const double _deliveryFee = 50;
 
-  final NumberFormat _currencyFormatter =
-      NumberFormat('#,##0.00');
-
   /// Created once in initState so the realtime subscription survives
   /// rebuilds instead of being re-opened each time.
   late final Stream<List<Map<String, dynamic>>> _cartStream;
@@ -70,24 +67,12 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     _cartStream = AppRepository.watchCart();
   }
 
-  double _getPrice(Map<String, dynamic> item) {
-    final price = item["price"];
+  double _getPrice(Map<String, dynamic> item) => CurrencyFormat.parse(item["price"]);
 
-    if (price is num) return price.toDouble();
+  int _getQuantity(Map<String, dynamic> item) =>
+      CurrencyFormat.parseQuantity(item["quantity"]);
 
-    return double.tryParse(price?.toString() ?? '') ?? 0;
-  }
-
-  int _getQuantity(Map<String, dynamic> item) {
-    final quantity =
-        int.tryParse(item["quantity"]?.toString() ?? '1') ?? 1;
-
-    return quantity < 1 ? 1 : quantity;
-  }
-
-  String _formatCurrency(double amount) {
-    return 'PHP ${_currencyFormatter.format(amount)}';
-  }
+  String _formatCurrency(double amount) => CurrencyFormat.php(amount);
 
   /// True when this screen checks out a single product straight from
   /// its details page rather than the saved cart.
@@ -470,7 +455,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
             ),
             content: Text(
               "Your transaction has been completed.\n\n"
-              "Total: PHP ${total.toStringAsFixed(2)}",
+              "Total: ${CurrencyFormat.php(total)}",
               textAlign: TextAlign.center,
             ),
             actionsAlignment: MainAxisAlignment.center,

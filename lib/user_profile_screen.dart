@@ -7,15 +7,18 @@ import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'currency_format.dart';
 import 'gradient_header.dart';
 import 'change_password_screen.dart';
 import 'create_account_screen.dart';
 import 'order_detail_screen.dart';
+import 'order_status.dart';
 import 'cart_screen.dart';
 import 'login_screen.dart';
 import 'app_repository.dart';
 import 'supabase_service.dart';
 import 'session.dart';
+import 'session_persistence.dart';
 import 'touchskin_cache.dart';
 
 class UserProfileScreen extends StatefulWidget {
@@ -54,9 +57,6 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
 
   /// Longest edge the picked image is resized to before upload.
   static const int _maxImageDimension = 512;
-
-  final NumberFormat _currencyFormatter =
-      NumberFormat('#,##0.00');
 
   bool _uploadingPicture = false;
 
@@ -265,19 +265,17 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
       final bytes = await pickedFile.readAsBytes();
       final resized = await _resizeImage(bytes);
 
-      // The resize always re-encodes to PNG, so the file is always
-      // named .png regardless of what the gallery called it. A fixed
-      // name means the path is the same on every upload, so the remove
-      // below always clears this user's previous picture -- had the
-      // extension followed the source file, a .jpg pick after a .png one
-      // would have left the old file orphaned in the bucket.
-      final path = 'avatars/$userId.png';
+      // Fixed name per user; always PNG because we re-encode. Path is
+      // relative to the `avatars` bucket root (not prefixed with the
+      // bucket name, which would create an `avatars/` subfolder).
+      final path = '$userId.png';
+      final legacyPath = 'avatars/$userId.png';
 
-      // Removes any previous picture so the bucket does not fill up
-      // with one file per upload.
+      // Remove current + legacy (double-prefixed) location so the bucket
+      // doesn't accumulate orphaned files across path format changes.
       await SupabaseService.client.storage
           .from(_avatarBucket)
-          .remove([path]);
+          .remove([path, legacyPath]);
 
       await SupabaseService.client.storage
           .from(_avatarBucket)
@@ -294,14 +292,23 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
           .from(_avatarBucket)
           .getPublicUrl(path);
 
-      await AppRepository.updateProfileImage(publicUrl);
+      // Cache-bust: storage path is fixed (overwritten), so the base URL
+      // stays the same and image caches (disk + in-memory/CDN) would keep
+      // serving the old photo. Saving a versioned URL makes the profile
+      // stream emit a changed value and forces a fresh fetch.
+      final versionedUrl = Uri.parse(publicUrl)
+          .replace(
+            queryParameters: {
+              'v': DateTime.now().millisecondsSinceEpoch.toString(),
+            },
+          )
+          .toString();
 
-      // The upload always reuses the same fixed path, so the public
-      // URL never changes -- without this, the freshly picked picture
-      // would sit behind the old cached copy until the cache entry
-      // goes stale. Evicting just that one file keeps every other
-      // cached image intact.
+      await AppRepository.updateProfileImage(versionedUrl);
+
+      // Best-effort eviction of the base URL from the disk cache.
       await TouchSkinCacheManager.instance.removeFile(publicUrl);
+      await TouchSkinCacheManager.instance.removeFile(versionedUrl);
 
       if (!mounted) return;
 
@@ -328,6 +335,7 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
   }
 
   Future<void> _logout() async {
+    await SessionPersistence.clear();
     await SupabaseService.client.auth.signOut();
 
     if (!mounted) return;
@@ -340,15 +348,8 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
     Navigator.of(context).popUntil((route) => route.isFirst);
   }
 
-  double _parseAmount(dynamic amount) {
-    if (amount is num) return amount.toDouble();
-
-    return double.tryParse(amount?.toString() ?? '') ?? 0;
-  }
-
-  String _formatCurrency(dynamic amount) {
-    return 'PHP ${_currencyFormatter.format(_parseAmount(amount))}';
-  }
+  String _formatCurrency(dynamic amount) =>
+      CurrencyFormat.php(CurrencyFormat.parse(amount));
 
   Widget _buildProfileCard(String? profileImageUrl) {
     final hasCustomPicture =
@@ -588,8 +589,8 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
       }
     }
 
-    final isCancelled =
-        order["status"]?.toString().toLowerCase() == "cancelled";
+    final status = readOrderStatus(order["status"]);
+    final isCancelled = status.isCancelled;
 
     return GestureDetector(
       onTap: () {
@@ -627,17 +628,13 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
             height: 46,
 
             decoration: BoxDecoration(
-              color: const Color(0xFFFCEBEF),
+              color: status.background,
               borderRadius: BorderRadius.circular(14),
             ),
 
             child: Icon(
-              isCancelled
-                  ? Icons.cancel_rounded
-                  : Icons.receipt_long_rounded,
-              color: isCancelled
-                  ? Colors.redAccent
-                  : const Color(0xFFC25E7A),
+              status.icon,
+              color: status.color,
             ),
           ),
 
@@ -657,14 +654,11 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
                 const SizedBox(height: 4),
 
                 Text(
-                  isCancelled
-                      ? "Cancelled"
-                      : "${order["payment_method"] ?? "N/A"}",
+                  "${status.label} \u00b7 ${order["payment_method"] ?? "N/A"}",
                   style: TextStyle(
-                    color: isCancelled
-                        ? Colors.redAccent
-                        : Colors.grey,
+                    color: status.color,
                     fontSize: 12,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
               ],
